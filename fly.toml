@@ -1,0 +1,5 @@
+app = "g-bot"
+primary_region = "fra"
+
+[build]
+dockerfile = "Dockerfile"
