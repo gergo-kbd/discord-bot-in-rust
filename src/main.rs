@@ -144,15 +144,79 @@ impl EventHandler for Handler {
             }
         }
 
+        if msg.content.starts_with("!set_general_prompt ") {
+            let new_prompt = msg.content.trim_start_matches("!set_general_prompt ").trim();
+            if !new_prompt.is_empty() {
+                let _ = sqlx::query("INSERT OR REPLACE INTO prompts (name, content) VALUES ('general_master', ?)")
+                    .bind(new_prompt)
+                    .execute(&self.db).await;
+                let _ = msg.channel_id.say(&ctx.http, "✅ Általános elemzői prompt frissítve!").await;
+                }
+            }
+            
+            if msg.content == "!general_analyze" {
+                println!("--- Stratégiai elemzés indítása ---");
+                let _ = msg.channel_id.broadcast_typing(&ctx.http).await;
+
+                // 1. Prompt lekérése
+                let row: (String,) = sqlx::query_as("SELECT content FROM prompts WHERE name = 'general_master'")
+                    .fetch_one(&self.db)
+                    .await
+                    .unwrap_or(("Mondd meg mi a legjobb vétel. A válasz elején a TICKER legyen!".to_string(),));
+
+                // 2. Gemini hívás
+                let analysis = self.call_gemini(&row.0, "Mi a legjobb vétel ma?").await;
+                println!("Gemini válasz megérkezett, hossza: {}", analysis.len());
+
+                if analysis.is_empty() {
+                    let _ = msg.channel_id.say(&ctx.http, "Hiba: Az AI üres választ küldött.").await;
+                    return;
+                }
+
+                // 3. Ticker kinyerése és MENTÉS
+                let first_word = analysis.split_whitespace()
+                    .next()
+                    .unwrap_or("UNKNOWN")
+                    .trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_uppercase();
+
+                let _ = sqlx::query("INSERT INTO signals (ticker, recommendation) VALUES (?, ?)")
+                    .bind(&first_word)
+                    .bind(&analysis)
+                    .execute(&self.db)
+                    .await;
+
+                // 4. BIZTONSÁGOS KÜLDÉS (Darabolás)
+                let mut current_text = analysis.as_str();
+                
+                while !current_text.is_empty() {
+                    if current_text.len() <= 1900 {
+                        let _ = msg.channel_id.say(&ctx.http, current_text).await;
+                        break; // Kilépünk, mert végeztünk
+                    } else {
+                        // Keressünk egy sortörést az első 1900 karakterben
+                        let end_idx = current_text[..1900].rfind('\n').unwrap_or(1900);
+                        let chunk = &current_text[..end_idx];
+                        let _ = msg.channel_id.say(&ctx.http, chunk).await;
+                        
+                        // A maradékot vágjuk le és folytassuk
+                        current_text = &current_text[end_idx..].trim_start();
+                        
+                        // Biztonsági fék: ha nem csökken a szöveg, álljunk le
+                        if current_text.is_empty() { break; }
+                    }
+                }
+                println!("--- Elemzés sikeresen kiküldve ---");
+}
     }
 }
 
 impl Handler {
 async fn call_gemini(&self, system_prompt: &str, user_data: &str) -> String {
     let client = reqwest::Client::new();
-    // A listád alapján a gemini-2.0-flash biztosan létezik nálad
     let url = format!("https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={}", self.api_key);
 
+    println!("DEBUG: Gemini kérés küldése az URL-re...");
 
     let payload = serde_json::json!({
         "contents": [{
@@ -162,23 +226,30 @@ async fn call_gemini(&self, system_prompt: &str, user_data: &str) -> String {
         }]
     });
 
-    let res = client.post(url).json(&payload).send().await;
+    // Adjunk hozzá egy időkorlátot (timeout), hogy ne várjon örökké!
+    let res = client.post(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&payload)
+        .send()
+        .await;
+
     match res {
         Ok(response) => {
-            let status = response.status();
             let json: serde_json::Value = response.json().await.unwrap_or_default();
             
-            if !status.is_success() {
-                println!("Gemini API Hiba ({}): {:?}", status, json);
-                return format!("API Hiba: {}. Ellenőrizd a fly logs-ot!", status);
+            if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                // --- IDE TEDD A TISZTÍTÁST ---
+                let cleaned_text = text.split("________________").next().unwrap_or(text);
+                cleaned_text.trim().to_string() 
+                // -----------------------------
+            } else {
+                "Hiba: Az AI válasza nem értelmezhető.".to_string()
             }
-
-            json["candidates"][0]["content"]["parts"][0]["text"]
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "Az AI nem küldött választ.".to_string())
         },
-        Err(e) => format!("Hálózati hiba: {:?}", e),
+        Err(e) => {
+            println!("DEBUG: Hiba a Gemini hívás közben: {:?}", e);
+            format!("Hálózati hiba: {}", e)
+        }
     }
 }
 }
@@ -227,10 +298,24 @@ async fn main() {
         .expect("Nem sikerült kapcsolódni az adatbázishoz (Code 14?)");
 
     // Tábla létrehozása
+    // 1. Prompts tábla
     sqlx::query("CREATE TABLE IF NOT EXISTS prompts (name TEXT PRIMARY KEY, content TEXT)")
         .execute(&db)
         .await
-        .expect("Hiba a tábla létrehozásakor");
+        .expect("Hiba a prompts tábla létrehozásakor");
+
+    // 2. Signals tábla 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL,
+            recommendation TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )" 
+        ) 
+        .execute(&db)
+        .await
+        .expect("Hiba a signals tábla létrehozásakor");
 
     // Alapértelmezett prompt beszúrása
     let _ = sqlx::query("INSERT OR IGNORE INTO prompts (name, content) VALUES ('master', 'Alapértelmezett elemző vagy.')")
