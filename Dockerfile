@@ -1,11 +1,21 @@
-FROM rust:1-bookworm AS builder
-WORKDIR /app
+# Használjuk a legfrissebb Rust verziót (ami már 1.88 felett van)
+FROM rust:1.88-slim as builder
+
+# Alapvető build eszközök telepítése
+RUN apt-get update && apt-get install -y pkg-config libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/g-bot
 COPY . .
 
-RUN rm -f Cargo.lock && cargo build --release
+# Fordítás
+RUN cargo build --release
 
+# Második stage a futtatáshoz
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y libssl-dev ca-certificates && rm -rf /var/lib/apt/lists/*
-#  Cargo.toml name
-COPY --from=builder /app/target/release/g-bot /usr/local/bin/g-bot
-CMD ["/usr/local/bin/g-bot"]
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+# Másoljuk át a binárist
+COPY --from=builder /usr/src/g-bot/target/release/g-bot /usr/local/bin/g-bot
+
+# Indítás
+CMD ["g-bot"]
