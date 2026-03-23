@@ -72,7 +72,7 @@ use std::env;
 use yahoo_finance_api as yf;
 
 struct Handler {
-    db: SqlitePool,
+    db: sqlx::SqlitePool,
     api_key: String,
 }
 
@@ -81,25 +81,70 @@ impl EventHandler for Handler {
    async fn message(&self, ctx: Context, msg: Message) {
     // Csak a parancsokra figyeljen
     if msg.content.starts_with("!analyze ") {
-        println!("Analízis kérés érkezett: {}", msg.content); // Logoljuk, hogy látjuk-e
+        println!("Analízis kérés érkezett: {}", msg.content);
+
+        let ticker = msg.content.replace("!analyze ", "").trim().to_uppercase();
         
-        let ticker = msg.content.replace("!analyze ", "").to_uppercase();
-        
-        // 1. Prompt lekérése (biztonságosabban)
+        if ticker.is_empty() {
+             let _ = msg.channel_id.say(&ctx.http, "Adj meg egy szimbólumot! (Pl: !analyze AAPL)").await;
+             return;
+        }
+
+        // 1. Prompt lekérése
         let row: (String,) = sqlx::query_as("SELECT content FROM prompts WHERE name = 'master'")
             .fetch_one(&self.db)
             .await
-            .unwrap_or(("Alapértelmezett elemző vagy.".to_string(),));
+            .unwrap_or(("Te egy tőzsdei elemző vagy.".to_string(),));
 
         // 2. Gemini Hívás
-        msg.channel_id.broadcast_typing(&ctx.http).await.ok(); // Mutassuk, hogy ír a bot
+        let _ = msg.channel_id.broadcast_typing(&ctx.http).await; 
         let analysis = self.call_gemini(&row.0, &ticker).await;
 
-        if let Err(why) = msg.channel_id.say(&ctx.http, analysis).await {
-            println!("Hiba az üzenet küldésekor: {:?}", why);
+        // 3. Biztonságos küldés (darabolás, ha túl hosszú)
+        let mut current_text = analysis.as_str();
+        
+        while !current_text.is_empty() {
+            // Ha hosszabb mint 1900 karakter, keressünk egy biztonságos töréspontot
+            if current_text.len() > 1900 {
+                let wrap_point = current_text[..1900].rfind('\n').unwrap_or(1900);
+                let chunk = &current_text[..wrap_point];
+                let _ = msg.channel_id.say(&ctx.http, chunk).await;
+                current_text = current_text[wrap_point..].trim_start();
+            } else {
+                // Ha belefér, küldjük el az egészet
+                if let Err(why) = msg.channel_id.say(&ctx.http, current_text).await {
+                    println!("Hiba az üzenet küldésekor: {:?}", why);
+                }
+                break;
+            }
         }
     }
-}
+        if msg.content.starts_with("!setprompt ") {
+            let new_prompt = msg.content.trim_start_matches("!setprompt ").trim();
+            
+            if new_prompt.is_empty() {
+                // Itt kivettem a ?-et a végéről
+                let _ = msg.channel_id.say(&ctx.http, "Hiba: Adj meg egy új prompt szöveget!").await;
+            } else {
+                let result = sqlx::query("UPDATE prompts SET content = ? WHERE name = 'master'")
+                    .bind(new_prompt)
+                    .execute(&self.db)
+                    .await;
+
+                match result {
+                    Ok(_) => {
+                        // Itt is kivettem a ?-et
+                        let _ = msg.channel_id.say(&ctx.http, "✅ A Master Prompt sikeresen frissítve!").await;
+                    },
+                    Err(e) => {
+                        // És itt is
+                        let _ = msg.channel_id.say(&ctx.http, format!("❌ Adatbázis hiba: {}", e)).await;
+                    }
+                }
+            }
+        }
+
+    }
 }
 
 impl Handler {
